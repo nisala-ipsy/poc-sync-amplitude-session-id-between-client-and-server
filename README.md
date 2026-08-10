@@ -1,36 +1,98 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Amplitude server–client session sync
 
-## Getting Started
+Prototype for **Approach A**: the server owns the Amplitude session id. Both the browser SDK and the Node SDK read the same `amp_ident` cookie, so server- and client-side events share one session.
 
-First, run the development server:
+## How it works
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+┌─────────────┐
+│   Browser   │
+└──────┬──────┘
+       │  request (may carry amp_ident cookie)
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  proxy.ts  (runs before every page / API request)            │
+│                                                              │
+│  decode cookie → touch(lastActivity) or createIdentity()     │
+│  rewrite cookie on request headers + Set-Cookie on response  │
+└──────┬───────────────────────────────────────────────────────┘
+       │
+       ├──────────────────────────────────────┐
+       │                                      │
+       ▼                                      ▼
+┌─────────────────────┐              ┌─────────────────────┐
+│  SSR (page.tsx)     │              │  API (/api/event)   │
+│  serverIdentity()   │              │  trackServer()      │
+│  reads amp_ident    │              │  reads amp_ident    │
+└──────────┬──────────┘              └──────────┬──────────┘
+           │                                    │
+           │         amp_ident cookie           │
+           │    deviceId ~ sessionId ~ lastActivity
+           │                                    │
+           ▼                                    ▼
+┌─────────────────────┐              ┌─────────────────────┐
+│  @amplitude/        │              │  @amplitude/        │
+│  analytics-node     │              │  analytics-browser  │
+│  session_id from    │              │  init(sessionId     │
+│  cookie stamp       │              │  from cookie)       │
+└──────────┬──────────┘              └──────────┬──────────┘
+           │                                    │
+           └──────────────┬─────────────────────┘
+                          ▼
+                   ┌─────────────┐
+                   │  Amplitude  │
+                   │  (same      │
+                   │  session_id)│
+                   └─────────────┘
+
+Client-only path (after hydration):
+
+  initAmplitude()
+       │
+       ├─ read amp_ident → init browser SDK with sessionId + deviceId
+       │
+       └─ before plugin: onSessionIdChanged → write amp_ident back
+          (keeps cookie in sync when the SDK rotates its session)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### Session expiry
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Expiry is **not** delegated to either SDK alone. Shared logic in `lib/amplitude/identity.ts` uses a sliding window: a session expires only when **neither** the server nor the client has been active within `SESSION_TIMEOUT_MS` (30 min).
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Actor | What updates `lastActivity` |
+|-------|----------------------------|
+| Proxy | Every incoming request (`touch`) |
+| Browser SDK | `onSessionIdChanged` hook writes cookie |
 
-## Learn More
+The proxy mints the cookie on first visit, so even the initial SSR pass already has a valid session id — no client round-trip required.
 
-To learn more about Next.js, take a look at the following resources:
+### Cookie
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Field | Purpose |
+|-------|---------|
+| `deviceId` | Stable device identifier (UUID) |
+| `sessionId` | Amplitude convention: epoch-ms when the session started |
+| `lastActivity` | Drives the sliding expiry window |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Cookie name: `amp_ident`. Not `httpOnly` — the browser SDK must read the same values the server uses.
 
-## Deploy on Vercel
+## Getting started
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+pnpm install
+pnpm dev
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Open [http://localhost:3000](http://localhost:3000). The page shows the current identity from SSR; use the buttons to fire client or server events.
+
+Set `NEXT_PUBLIC_AMPLITUDE_API_KEY` (and optionally `AMPLITUDE_API_KEY` for server-only) in `.env.local`.
+
+## Key files
+
+| File | Role |
+|------|------|
+| `proxy.ts` | Mint / slide identity cookie on every request |
+| `lib/amplitude/identity.ts` | Shared types, encode/decode, expiry logic |
+| `lib/amplitude/server.ts` | Node SDK — stamps `session_id` from cookie |
+| `lib/amplitude/client.ts` | Browser SDK — init from cookie, sync changes back |
+| `app/api/event/route.ts` | Example server-side track call |
