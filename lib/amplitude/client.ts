@@ -7,6 +7,7 @@ import {
   decodeIdentity,
   encodeIdentity,
   IDENT_COOKIE,
+  SESSION_TIMEOUT_MS,
   type Identity,
 } from "./identity";
 
@@ -43,7 +44,18 @@ export async function initAmplitude(): Promise<void> {
   await client.init(process.env.NEXT_PUBLIC_AMPLITUDE_API_KEY ?? "", {
     sessionId: identity.sessionId,
     deviceId: identity.deviceId,
-    sessionTimeout: 10_000,
+    sessionTimeout: SESSION_TIMEOUT_MS,
+    defaultTracking: false,
+  }).promise;
+
+  await client.add({
+    name: "session-last-event-time-seed",
+    type: "before",
+    setup(config) {
+      const cookie = readIdentityFromCookie();
+      config.lastEventTime = cookie?.lastActivity ?? Date.now();
+      return Promise.resolve();
+    },
   }).promise;
 
   client.add({
@@ -66,5 +78,5 @@ export function trackClient(
   eventType: string,
   properties?: Record<string, unknown>,
 ): void {
-  client?.track(eventType, properties, { time: Date.now() });
+  client?.track(eventType, properties);
 }
